@@ -839,7 +839,7 @@ def accumulator(init, init_args: Optional[Iterable], accumulate,
                                                                   finalize))
 
 
-def unique_values(expression):
+def push_unique(expression):
     """
     Return an array of unique expression values for each group
     """
