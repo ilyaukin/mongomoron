@@ -33,25 +33,27 @@ class DatabaseConnection(object):
         """
         return self._db
 
+    def session(self):
+        return getattr(self.threadlocal, 'session', None)
+
     def create_collection(self, collection: Union['Collection', str],
                           override: bool = True) -> 'Collection':
         collection_name = collection._name if isinstance(collection,
                                                          Collection) else collection
         if override and self._collection_exists(collection_name):
-            self.db()[collection_name].drop(session=self.threadlocal.session)
-        self.db().create_collection(self, collection_name,
-                                    session=self.threadlocal.session)
+            self.db()[collection_name].drop(session=self.session())
+        self.db().create_collection(collection_name, session=self.session())
         return Collection(collection_name)
 
     def create_index(self, builder: 'IndexBuilder'):
         self.db()[builder.collection._name].create_index(builder.keys,
                                                          unique=builder.is_unique,
-                                                         session=self.threadlocal.session)
+                                                         session=self.session())
 
     def drop_collection(self, collection: Union['Collection', str]):
         collection_name = collection._name if isinstance(collection,
                                                          Collection) else collection
-        self.db()[collection_name].drop(session=self.threadlocal.session)
+        self.db()[collection_name].drop(session=self.session())
 
     def execute(self, builder: 'Executable') -> Union[
         Cursor, dict, InsertOneResult, InsertManyResult, Any]:
@@ -72,12 +74,12 @@ class DatabaseConnection(object):
                              [builder.documents[0], '...'] if len(
                                  builder.documents) > 1 else builder.documents)
                 return self.db()[builder.collection._name].insert_many(
-                    builder.documents, session=self.threadlocal.session)
+                    builder.documents, session=self.session())
             else:
                 logger.debug('db.%s.insert_one(%s)', builder.collection._name,
                              builder.documents[0])
                 return self.db()[builder.collection._name].insert_one(
-                    builder.documents[0], session=self.threadlocal.session)
+                    builder.documents[0], session=self.session())
         elif isinstance(builder, UpdateBuilder):
             if not builder.one:
                 logger.debug('db.%s.update(%s, %s)', builder.collection._name,
@@ -92,12 +94,12 @@ class DatabaseConnection(object):
                              builder.update_operators)
                 return self.db()[builder.collection._name].update_one(
                     builder.filter_expression, builder.update_operators,
-                    session=self.threadlocal.session)
+                    session=self.session())
         elif isinstance(builder, DeleteBuilder):
             logger.debug('db.%s.delete_many(%s)', builder.collection._name,
                          builder.filter_expression)
             return self.db()[builder.collection._name].delete_many(
-                builder.filter_expression, session=self.threadlocal.session)
+                builder.filter_expression, session=self.session())
         elif isinstance(builder, AggregationPipelineBuilder):
             pipeline = builder.get_pipeline()
             logger.debug('db.%s.aggregate(%s)', builder.collection._name,
@@ -949,9 +951,8 @@ class SubtractPipelineOperator(PipelineOperator):
         self.right = right
 
     def to_obj(self, context: int = Context.AGGREGATION):
-        return {'$subtract': [Expression.express(self.left, context,
-                                                 Expression.express(self.right,
-                                                                    context))]}
+        return {'$subtract': [Expression.express(self.left, context),
+                              Expression.express(self.right, context)]}
 
 
 class ArrayElemAtPipelineOperator(PipelineOperator):
