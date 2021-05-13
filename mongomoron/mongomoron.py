@@ -39,7 +39,8 @@ class DatabaseConnection(object):
     def create_collection(self, collection: Union['Collection', str],
                           override: bool = True) -> 'Collection':
         collection_name = collection._name if isinstance(collection,
-                                                         Collection) else collection
+                                                         Collection) else \
+            collection
         if override and self._collection_exists(collection_name):
             self.db()[collection_name].drop(session=self.session())
         self.db().create_collection(collection_name, session=self.session())
@@ -52,7 +53,8 @@ class DatabaseConnection(object):
 
     def drop_collection(self, collection: Union['Collection', str]):
         collection_name = collection._name if isinstance(collection,
-                                                         Collection) else collection
+                                                         Collection) else \
+            collection
         self.db()[collection_name].drop(session=self.session())
 
     def execute(self, builder: 'Executable') -> Union[
@@ -86,7 +88,8 @@ class DatabaseConnection(object):
                              builder.filter_expression,
                              builder.update_operators)
                 return self.db()[builder.collection._name].update(
-                    builder.filter_expression, builder.update_operators)
+                    builder.filter_expression, builder.update_operators,
+                    upsert=builder.upsert)
             else:
                 logger.debug('db.%s.update_one(%s, %s)',
                              builder.collection._name,
@@ -94,6 +97,7 @@ class DatabaseConnection(object):
                              builder.update_operators)
                 return self.db()[builder.collection._name].update_one(
                     builder.filter_expression, builder.update_operators,
+                    upsert=builder.upsert,
                     session=self.session())
         elif isinstance(builder, DeleteBuilder):
             logger.debug('db.%s.delete_many(%s)', builder.collection._name,
@@ -243,7 +247,8 @@ class Expression(object):
     """
     An expression.
 
-    https://docs.mongodb.com/manual/meta/aggregation-quick-reference/#aggregation-expressions
+    https://docs.mongodb.com/manual/meta/aggregation-quick-reference
+    /#aggregation-expressions
     """
 
     def to_obj(self, context: int = Context.CRUD):
@@ -586,9 +591,11 @@ class UpdateBuilder(Executable):
     Update builder
     """
 
-    def __init__(self, collection: Collection, one: bool = False):
+    def __init__(self, collection: Collection, one: bool = False,
+                 upsert: bool = False):
         self.collection = collection
         self.one = one
+        self.upsert = upsert
         self.filter_expression = {}
         self.update_operators = {}
 
@@ -601,12 +608,12 @@ class UpdateBuilder(Executable):
         return self
 
 
-def update(collection: Collection):
-    return UpdateBuilder(collection)
+def update(collection: Collection, upsert: bool = False):
+    return UpdateBuilder(collection, upsert=upsert)
 
 
-def update_one(collection: Collection):
-    return UpdateBuilder(collection, True)
+def update_one(collection: Collection, upsert: bool = False):
+    return UpdateBuilder(collection, one=True, upsert=upsert)
 
 
 class DeleteBuilder(Executable):
@@ -648,7 +655,8 @@ class AggregationPipelineBuilder(Executable):
         return self
 
     def group(self, _id,
-              **kwargs: 'AccumulatorExpression') -> 'AggregationPipelineBuilder':
+              **kwargs: 'AccumulatorExpression') -> \
+            'AggregationPipelineBuilder':
         self.stages.append(GroupPipelineStage(_id, **kwargs))
         return self
 
@@ -874,7 +882,8 @@ class LookupPipelineStage(PipelineStage):
         self.local_field = local_field if isinstance(local_field,
                                                      str) else local_field._name
         self.foreign_field = foreign_field if isinstance(foreign_field,
-                                                         str) else foreign_field._name
+                                                         str) else \
+            foreign_field._name
         self.as_ = as_
 
     def to_obj(self, context: int = Context.AGGREGATION):
