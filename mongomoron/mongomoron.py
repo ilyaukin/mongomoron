@@ -1,6 +1,6 @@
 import logging
 import threading
-from typing import Iterable, Union, Any, Optional, Callable
+from typing import Iterable, Union, Any, Optional, Callable, Tuple
 
 import pymongo
 from pymongo.cursor import Cursor
@@ -87,9 +87,9 @@ class DatabaseConnection(object):
                 logger.debug('db.%s.update(%s, %s)', builder.collection._name,
                              builder.filter_expression,
                              builder.update_operators)
-                return self.db()[builder.collection._name].update(
+                return self.db()[builder.collection._name].update_many(
                     builder.filter_expression, builder.update_operators,
-                    upsert=builder.upsert)
+                    upsert=builder.upsert, session=self.session())
             else:
                 logger.debug('db.%s.update_one(%s, %s)',
                              builder.collection._name,
@@ -108,7 +108,8 @@ class DatabaseConnection(object):
             pipeline = builder.get_pipeline()
             logger.debug('db.%s.aggregate(%s)', builder.collection._name,
                          pipeline)
-            return self.db()[builder.collection._name].aggregate(pipeline)
+            return self.db()[builder.collection._name].aggregate(pipeline,
+                                                                 session=self.session())
         else:
             raise NotImplementedError(
                 'Execution of %s not implemented' % type(builder))
@@ -268,7 +269,7 @@ class Expression(object):
                       (str, int, float, bool)) or expression is None:
             return expression
         if isinstance(expression, Iterable):
-            return list(Expression.express(item) for item in expression)
+            return list(Expression.express(item, context) for item in expression)
         return {'$literal': expression}
 
     def __eq__(self, other):
@@ -607,6 +608,10 @@ class UpdateBuilder(Executable):
         self.update_operators.update({'$set': d})
         return self
 
+    def unset(self, *fields: str) -> 'UpdateBuilder':
+        self.update_operators.update({'$unset': dict((field, '') for field in fields)})
+        return self
+
 
 def update(collection: Collection, upsert: bool = False):
     return UpdateBuilder(collection, upsert=upsert)
@@ -614,6 +619,10 @@ def update(collection: Collection, upsert: bool = False):
 
 def update_one(collection: Collection, upsert: bool = False):
     return UpdateBuilder(collection, one=True, upsert=upsert)
+
+
+def update_many(collection: Collection, upsert: bool = False):
+    return UpdateBuilder(collection, one=False, upsert=upsert)
 
 
 class DeleteBuilder(Executable):
@@ -638,7 +647,7 @@ class AggregationPipelineBuilder(Executable):
     Aggregation pipeline builder
     """
 
-    def __init__(self, collection: Collection):
+    def __init__(self, collection: Collection = None):
         self.collection = collection
         self.stages = []
 
@@ -648,6 +657,13 @@ class AggregationPipelineBuilder(Executable):
 
     def add_fields(self, **kwargs) -> 'AggregationPipelineBuilder':
         self.stages.append(AddFieldsPipelineStage(**kwargs))
+        return self
+
+    def bucket(self, group_by: Expression,
+               boundaries: Union[Iterable[int], Iterable[float]],
+               default: Any,
+               **kwargs: Expression) -> 'AggregationPipelineBuilder':
+        self.stages.append(BucketPipelineStage(group_by, boundaries, default, **kwargs))
         return self
 
     def project(self, *args: Field, **kwargs) -> 'AggregationPipelineBuilder':
@@ -672,11 +688,27 @@ class AggregationPipelineBuilder(Executable):
         self.stages.append(ReplaceRootPipelineStage(new_root))
         return self
 
+    def unset(self, *excluded_fields: Union[Field, str]) -> 'AggregationPipelineBuilder':
+        self.stages.append(UnsetPipelineStage(*excluded_fields))
+        return self
+
+    def unwind(self, field: Field) -> 'AggregationPipelineBuilder':
+        self.stages.append(UnwindPipelineStage(field))
+        return self
+
+    def sort(self, *args: Tuple[Field, int]) -> 'AggregationPipelineBuilder':
+        self.stages.append(SortPipelineStage(*args))
+        return self
+
+    def facet(self, **kwargs: 'AggregationPipelineBuilder') -> 'AggregationPipelineBuilder':
+        self.stages.append(FacetPipelineStage(**kwargs))
+        return self
+
     def get_pipeline(self):
         return [stage.to_obj(Context.AGGREGATION) for stage in self.stages]
 
 
-def aggregate(collection: Collection):
+def aggregate(collection: Collection = None):
     return AggregationPipelineBuilder(collection)
 
 
@@ -716,6 +748,36 @@ class AddFieldsPipelineStage(PipelineStage):
             self.new_fields.items())}
 
 
+class BucketPipelineStage(PipelineStage):
+    """
+    Categorizes incoming documents into groups, called buckets,
+     based on a specified expression and bucket boundaries and
+     outputs a document per each bucket. Each output document
+     contains an _id field whose value specifies the inclusive
+     lower bound of the bucket.
+    """
+
+    def __init__(self, group_by: Expression,
+                 boundaries: Union[Iterable[int], Iterable[float]],
+                 default: Any,
+                 **kwargs: Expression):
+        self.group_by = group_by
+        self.boundaries = boundaries
+        self.default = default
+        self.output = kwargs
+
+    def to_obj(self, context: int = Context.AGGREGATION):
+        return {
+            '$bucket': {
+                'groupBy': Expression.express(self.group_by, context),
+                'boundaries': list(self.boundaries),
+                'default': self.default,
+                'output': dict((name, Expression.express(value, context))
+                               for name, value in self.output.items())
+            }
+        }
+
+
 class ProjectPipelineStage(PipelineStage):
     """
     Passes along the document with the requested fields
@@ -732,6 +794,50 @@ class ProjectPipelineStage(PipelineStage):
                  name, expression in
                  self.new_or_reset_fields.items()))
         return {'$project': spec}
+
+
+class UnsetPipelineStage(PipelineStage):
+    """
+    Removes/excludes fields from documents
+    """
+
+    def __init__(self, *args: Union[Field, str]):
+        self.excluded_fields = args
+
+    def to_obj(self, context: int = Context.AGGREGATION):
+        def field_name(field):
+            if isinstance(field, Field):
+                return field._name
+            return field
+
+        return {'$unset': [field_name(field) for field in self.excluded_fields]}
+
+
+class UnwindPipelineStage(PipelineStage):
+    """
+    Deconstructs an array field from the input for *each*
+    element. Each output document with the value of the array
+    field replaced by the element.
+    """
+
+    def __init__(self, field: Field):
+        self.field = field
+
+    def to_obj(self, context: int = Context.AGGREGATION):
+        return {'$unwind': Expression.express(self.field, context)}
+
+
+class SortPipelineStage(PipelineStage):
+    """
+    Sorts input documents and returns them to the pipeline
+    in sorted order
+    """
+
+    def __init__(self, *args: Tuple[Field, int]):
+        self.fields = args
+
+    def to_obj(self, context: int = Context.AGGREGATION):
+        return {'$sort': dict((field[0]._name, field[1]) for field in self.fields)}
 
 
 class GroupPipelineStage(PipelineStage):
@@ -752,6 +858,24 @@ class GroupPipelineStage(PipelineStage):
                  name, expression in
                  self.new_fields.items()))
         return {'$group': spec}
+
+
+class FacetPipelineStage(PipelineStage):
+    """
+    Process multiple aggregation pipelines within a single stage
+    on the same set of input documents, each sub-pipeline as its own field
+    in the output document where its results are stored as an array
+    of documents.
+    """
+
+    def __init__(self, **kwargs: AggregationPipelineBuilder):
+        self.kw = kwargs
+
+    def to_obj(self, context: int = Context.AGGREGATION):
+        return {
+            '$facet': dict((name, pipeline.get_pipeline())
+                           for name, pipeline in self.kw.items())
+        }
 
 
 class AccumulatorExpression(Expression):
@@ -791,6 +915,34 @@ class UserDefinedAccumulatorExpression(Expression):
         }
 
 
+class PercentileExpression(Expression):
+    def __init__(self, input: Any, p: Iterable[Any]):
+        self.input = input
+        self.p = p
+
+    def to_obj(self, context: int = Context.AGGREGATION):
+        return {
+            '$percentile': {
+                'input': Expression.express(self.input, context),
+                'p': Expression.express(self.p, context),
+                'method': 'approximate',
+            }
+        }
+
+
+class MedianExpression(Expression):
+    def __init__(self, input: Any):
+        self.input = input
+
+    def to_obj(self, context: int = Context.AGGREGATION):
+        return {
+            '$median': {
+                'input': Expression.express(self.input, context),
+                'method': 'approximate',
+            }
+        }
+
+
 def sum_(expression):
     """
     Returns a sum of numerical values. Ignores non-numerical values
@@ -817,6 +969,13 @@ def avg(expression):
     Returns the average of numerical values. Ignores non-numerical values
     """
     return AccumulatorExpression('$avg', expression)
+
+
+def std(expression):
+    """
+    Calculates the population standard deviation of the input values
+    """
+    return AccumulatorExpression('$stdDevPop', expression)
 
 
 def push_(expression):
@@ -868,6 +1027,17 @@ def last(expression):
     Return value from the last document for each group
     """
     return AccumulatorExpression('$last', expression)
+
+
+def percentile(input: Any, p: Iterable[Any]):
+    return PercentileExpression(input, p)
+
+
+def median(input: Any):
+    """
+    Return an approximation of the median, the 50% percentile, as a scalar value.
+    """
+    return MedianExpression(input)
 
 
 class LookupPipelineStage(PipelineStage):
@@ -988,6 +1158,46 @@ class FilterPipelineOperator(PipelineOperator):
 
 def filter_(cond: Callable[[Field], Expression], array: Any):
     return FilterPipelineOperator(cond, array)
+
+
+class CondPipelineOperator(PipelineOperator):
+    def __init__(self, if_expr: Expression, then_expr: Any, else_expr: Any):
+        self.if_expr = if_expr
+        self.then_expr = then_expr
+        self.else_expr = else_expr
+
+    def to_obj(self, context: int = Context.AGGREGATION):
+        return {
+            '$cond': {
+                'if': Expression.express(self.if_expr, context),
+                'then': Expression.express(self.then_expr, context),
+                'else': Expression.express(self.else_expr, context),
+            }
+        }
+
+
+def cond(if_expr: Expression, then_expr: Any, else_expr: Any):
+    return CondPipelineOperator(if_expr, then_expr, else_expr)
+
+
+class SwitchPipelineOperator(PipelineOperator):
+    def __init__(self, branches: Iterable[Tuple[Any, Any]],
+                 default: Any = None):
+        self.branches = branches
+        self.default = default
+
+    def to_obj(self, context: int = Context.AGGREGATION):
+        return {'$switch': {
+            'branches': [{
+                'case': Expression.express(case, context),
+                'then': Expression.express(expr, context),
+            } for case, expr in self.branches],
+            'default': Expression.express(self.default, context),
+        }}
+
+
+def switch(branches: Iterable[Tuple[Any, Any]], default: Any = None):
+    return SwitchPipelineOperator(branches, default)
 
 
 class InPipelineOperator(PipelineOperator):
@@ -1144,7 +1354,7 @@ class GtePipelineOperator(PipelineOperator):
         self.right = right
 
     def to_obj(self, context: int = Context.AGGREGATION):
-        return {'$gte': [Expression.express(self.right, context),
+        return {'$gte': [Expression.express(self.left, context),
                          Expression.express(self.right, context)]}
 
 
