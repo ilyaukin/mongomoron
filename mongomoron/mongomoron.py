@@ -60,37 +60,33 @@ class DatabaseConnection(object):
     def execute(self, builder: 'Executable') -> Union[
         Cursor, dict, InsertOneResult, InsertManyResult, Any]:
         if isinstance(builder, QueryBuilder):
-            if not builder.one:
-                logger.debug('db.%s.find(%s)', builder.collection._name,
-                             builder.query_filer_document)
-                return self.db()[builder.collection._name].find(
-                    builder.query_filer_document)
-            else:
+            if builder.one:
                 logger.debug('db.%s.find_one(%s)', builder.collection._name,
                              builder.query_filer_document)
                 return self.db()[builder.collection._name].find_one(
                     builder.query_filer_document)
+            else:
+                logger.debug('db.%s.find(%s)', builder.collection._name,
+                             builder.query_filer_document)
+                cursor = self.db()[builder.collection._name].find(
+                    builder.query_filer_document)
+                if builder.sort_list:
+                    cursor.sort(builder.sort_list)
+                return cursor
         elif isinstance(builder, InsertBuilder):
-            if not builder.one:
+            if builder.one:
+                logger.debug('db.%s.insert_one(%s)', builder.collection._name,
+                             builder.documents[0])
+                return self.db()[builder.collection._name].insert_one(
+                    builder.documents[0], session=self.session())
+            else:
                 logger.debug('db.%s.insert_many(%s)', builder.collection._name,
                              [builder.documents[0], '...'] if len(
                                  builder.documents) > 1 else builder.documents)
                 return self.db()[builder.collection._name].insert_many(
                     builder.documents, session=self.session())
-            else:
-                logger.debug('db.%s.insert_one(%s)', builder.collection._name,
-                             builder.documents[0])
-                return self.db()[builder.collection._name].insert_one(
-                    builder.documents[0], session=self.session())
         elif isinstance(builder, UpdateBuilder):
-            if not builder.one:
-                logger.debug('db.%s.update(%s, %s)', builder.collection._name,
-                             builder.filter_expression,
-                             builder.update_operators)
-                return self.db()[builder.collection._name].update_many(
-                    builder.filter_expression, builder.update_operators,
-                    upsert=builder.upsert, session=self.session())
-            else:
+            if builder.one:
                 logger.debug('db.%s.update_one(%s, %s)',
                              builder.collection._name,
                              builder.filter_expression,
@@ -99,6 +95,13 @@ class DatabaseConnection(object):
                     builder.filter_expression, builder.update_operators,
                     upsert=builder.upsert,
                     session=self.session())
+            else:
+                logger.debug('db.%s.update(%s, %s)', builder.collection._name,
+                             builder.filter_expression,
+                             builder.update_operators)
+                return self.db()[builder.collection._name].update_many(
+                    builder.filter_expression, builder.update_operators,
+                    upsert=builder.upsert, session=self.session())
         elif isinstance(builder, DeleteBuilder):
             logger.debug('db.%s.delete_many(%s)', builder.collection._name,
                          builder.filter_expression)
@@ -217,9 +220,15 @@ class QueryBuilder(Executable):
         self.collection = collection
         self.one = one
         self.query_filer_document = {}
+        self.sort_list = []
 
     def filter(self, expression: 'Expression') -> 'QueryBuilder':
         self.query_filer_document.update(expression.to_obj(Context.CRUD))
+        return self
+
+    def sort(self, *args:Tuple[Union[str, 'Field'], int]) -> 'QueryBuilder':
+        args = [(str(f), order) for f, order in args]
+        self.sort_list += args
         return self
 
     def get_query_filter_document(self) -> dict:
@@ -361,6 +370,9 @@ class Field(Expression):
         @return:
         """
         return Field(self._name + '.' + item)
+
+    def __str__(self):
+        return self._name
 
     def __getattr__(self, item) -> 'Field':
         return self.get_field(item)
@@ -696,7 +708,7 @@ class AggregationPipelineBuilder(Executable):
         self.stages.append(UnwindPipelineStage(field))
         return self
 
-    def sort(self, *args: Tuple[Field, int]) -> 'AggregationPipelineBuilder':
+    def sort(self, *args: Tuple[Union[Field, str], int]) -> 'AggregationPipelineBuilder':
         self.stages.append(SortPipelineStage(*args))
         return self
 
@@ -833,11 +845,11 @@ class SortPipelineStage(PipelineStage):
     in sorted order
     """
 
-    def __init__(self, *args: Tuple[Field, int]):
+    def __init__(self, *args: Tuple[Union[Field, str], int]):
         self.fields = args
 
     def to_obj(self, context: int = Context.AGGREGATION):
-        return {'$sort': dict((field[0]._name, field[1]) for field in self.fields)}
+        return {'$sort': dict((str(field[0]), field[1]) for field in self.fields)}
 
 
 class GroupPipelineStage(PipelineStage):
