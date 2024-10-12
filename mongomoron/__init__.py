@@ -1,2 +1,2 @@
 from .expression import *
-from .connection import DatabaseConnection
+from .connection import DatabaseConnection, Operation
