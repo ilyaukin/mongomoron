@@ -1,148 +1,6 @@
-import logging
-import threading
-from typing import Iterable, Union, Any, Optional, Callable, Tuple
+from typing import Iterable, Any, Union, Tuple, Optional, Callable
 
 import pymongo
-from pymongo.cursor import Cursor
-from pymongo.database import Database
-from pymongo.results import InsertOneResult, InsertManyResult
-
-logger = logging.getLogger(__name__)
-
-
-class DatabaseConnection(object):
-    """
-    A wrapper for mongo Database, to do actual
-    operations with the database
-    """
-
-    def __init__(self, mongo_client: pymongo.MongoClient, db: Database):
-        self._mongo_client = mongo_client
-        self._db = db
-        self.threadlocal = threading.local()
-        self.threadlocal.session = None
-
-    def mongo_client(self):
-        return self._mongo_client
-
-    def db(self) -> Database:
-        """
-        Using db() instead of _db among the code
-        to be able override this class in cases when database
-        provided by other ways rather then in constructor
-        """
-        return self._db
-
-    def session(self):
-        return getattr(self.threadlocal, 'session', None)
-
-    def create_collection(self, collection: Union['Collection', str],
-                          override: bool = True) -> 'Collection':
-        collection_name = collection._name if isinstance(collection,
-                                                         Collection) else \
-            collection
-        if override and self._collection_exists(collection_name):
-            self.db()[collection_name].drop(session=self.session())
-        self.db().create_collection(collection_name, session=self.session())
-        return Collection(collection_name)
-
-    def create_index(self, builder: 'IndexBuilder'):
-        self.db()[builder.collection._name].create_index(builder.keys,
-                                                         unique=builder.is_unique,
-                                                         session=self.session())
-
-    def drop_collection(self, collection: Union['Collection', str]):
-        collection_name = collection._name if isinstance(collection,
-                                                         Collection) else \
-            collection
-        self.db()[collection_name].drop(session=self.session())
-
-    def execute(self, builder: 'Executable') -> Union[
-        Cursor, dict, InsertOneResult, InsertManyResult, Any]:
-        if isinstance(builder, QueryBuilder):
-            if builder.one:
-                logger.debug('db.%s.find_one(%s)', builder.collection._name,
-                             builder.query_filer_document)
-                return self.db()[builder.collection._name].find_one(
-                    builder.query_filer_document)
-            else:
-                logger.debug('db.%s.find(%s)', builder.collection._name,
-                             builder.query_filer_document)
-                cursor = self.db()[builder.collection._name].find(
-                    builder.query_filer_document)
-                if builder.sort_list:
-                    cursor.sort(builder.sort_list)
-                return cursor
-        elif isinstance(builder, InsertBuilder):
-            if builder.one:
-                logger.debug('db.%s.insert_one(%s)', builder.collection._name,
-                             builder.documents[0])
-                return self.db()[builder.collection._name].insert_one(
-                    builder.documents[0], session=self.session())
-            else:
-                logger.debug('db.%s.insert_many(%s)', builder.collection._name,
-                             [builder.documents[0], '...'] if len(
-                                 builder.documents) > 1 else builder.documents)
-                return self.db()[builder.collection._name].insert_many(
-                    builder.documents, session=self.session())
-        elif isinstance(builder, UpdateBuilder):
-            if builder.one:
-                logger.debug('db.%s.update_one(%s, %s)',
-                             builder.collection._name,
-                             builder.filter_expression,
-                             builder.update_operators)
-                return self.db()[builder.collection._name].update_one(
-                    builder.filter_expression, builder.update_operators,
-                    upsert=builder.upsert,
-                    session=self.session())
-            else:
-                logger.debug('db.%s.update(%s, %s)', builder.collection._name,
-                             builder.filter_expression,
-                             builder.update_operators)
-                return self.db()[builder.collection._name].update_many(
-                    builder.filter_expression, builder.update_operators,
-                    upsert=builder.upsert, session=self.session())
-        elif isinstance(builder, DeleteBuilder):
-            logger.debug('db.%s.delete_many(%s)', builder.collection._name,
-                         builder.filter_expression)
-            return self.db()[builder.collection._name].delete_many(
-                builder.filter_expression, session=self.session())
-        elif isinstance(builder, AggregationPipelineBuilder):
-            pipeline = builder.get_pipeline()
-            logger.debug('db.%s.aggregate(%s)', builder.collection._name,
-                         pipeline)
-            return self.db()[builder.collection._name].aggregate(pipeline,
-                                                                 session=self.session())
-        else:
-            raise NotImplementedError(
-                'Execution of %s not implemented' % type(builder))
-
-    def transactional(self, foo):
-        """
-        Decorator to do a method in the transaction.
-        Session is stored in thread local
-        @param foo: Function to be decorated
-        @return: Decorated function
-        """
-
-        def foo_in_transaction(*args, **kwargs):
-            self.threadlocal.session = self.mongo_client().start_session()
-            self.threadlocal.session.start_transaction()
-            try:
-                result = foo(*args, **kwargs)
-                self.threadlocal.session.commit_transaction()
-                return result
-            except Exception as e:
-                self.threadlocal.session.abort_transaction()
-                raise e
-            finally:
-                self.threadlocal.session = None
-
-        foo_in_transaction.__name__ = foo.__name__
-        return foo_in_transaction
-
-    def _collection_exists(self, collection_name: str) -> bool:
-        return collection_name in self.db().list_collection_names()
 
 
 class Collection(object):
@@ -174,73 +32,6 @@ Since Collection is used only for keeping name, it might be more convenient
 to reference to collection simple as 'document' in the queries
 """
 document = Collection('')
-
-
-class IndexBuilder(object):
-    """
-    Index object builder, to execute create_index
-    """
-
-    def __init__(self, collection: Collection):
-        self.collection = collection
-        self.keys = []
-        self.is_unique = False
-
-    def asc(self, field: str) -> 'IndexBuilder':
-        self.keys.append((field, pymongo.ASCENDING))
-        return self
-
-    def desc(self, field: str) -> 'IndexBuilder':
-        self.keys.append((field, pymongo.DESCENDING))
-        return self
-
-    def unique(self) -> 'IndexBuilder':
-        self.is_unique = True
-        return self
-
-
-def index(collection: Collection) -> IndexBuilder:
-    return IndexBuilder(collection)
-
-
-class Executable(object):
-    """
-    Common base for anything which can be executed on
-    the database connection, such as inserts, queries,
-    aggregations etc.
-    """
-
-
-class QueryBuilder(Executable):
-    """
-    Query object builder
-    """
-
-    def __init__(self, collection: Collection, one: bool = False):
-        self.collection = collection
-        self.one = one
-        self.query_filer_document = {}
-        self.sort_list = []
-
-    def filter(self, expression: 'Expression') -> 'QueryBuilder':
-        self.query_filer_document.update(expression.to_obj(Context.CRUD))
-        return self
-
-    def sort(self, *args:Tuple[Union[str, 'Field'], int]) -> 'QueryBuilder':
-        args = [(str(f), order) for f, order in args]
-        self.sort_list += args
-        return self
-
-    def get_query_filter_document(self) -> dict:
-        return self.query_filer_document
-
-
-def query(collection: Collection) -> QueryBuilder:
-    return QueryBuilder(collection)
-
-
-def query_one(collection: Collection) -> QueryBuilder:
-    return QueryBuilder(collection, True)
 
 
 class Context(object):
@@ -278,7 +69,8 @@ class Expression(object):
                       (str, int, float, bool)) or expression is None:
             return expression
         if isinstance(expression, Iterable):
-            return list(Expression.express(item, context) for item in expression)
+            return list(
+                Expression.express(item, context) for item in expression)
         return {'$literal': expression}
 
     def __eq__(self, other):
@@ -580,150 +372,6 @@ class ExistsExpression(FieldExpression):
         return {'$exists': self.exists}
 
 
-class InsertBuilder(Executable):
-    """
-    Insert builder
-    """
-
-    def __init__(self, collection: Collection, one: bool, *args: dict):
-        self.collection = collection
-        self.one = one
-        self.documents = args
-
-
-def insert_one(collection: Collection, document: dict):
-    return InsertBuilder(collection, True, *[document])
-
-
-def insert_many(collection: Collection, documents: Iterable[dict]):
-    return InsertBuilder(collection, False, *documents)
-
-
-class UpdateBuilder(Executable):
-    """
-    Update builder
-    """
-
-    def __init__(self, collection: Collection, one: bool = False,
-                 upsert: bool = False):
-        self.collection = collection
-        self.one = one
-        self.upsert = upsert
-        self.filter_expression = {}
-        self.update_operators = {}
-
-    def filter(self, expression: Expression) -> 'UpdateBuilder':
-        self.filter_expression.update(expression.to_obj(Context.CRUD))
-        return self
-
-    def set(self, d: dict) -> 'UpdateBuilder':
-        self.update_operators.update({'$set': d})
-        return self
-
-    def unset(self, *fields: str) -> 'UpdateBuilder':
-        self.update_operators.update({'$unset': dict((field, '') for field in fields)})
-        return self
-
-
-def update(collection: Collection, upsert: bool = False):
-    return UpdateBuilder(collection, upsert=upsert)
-
-
-def update_one(collection: Collection, upsert: bool = False):
-    return UpdateBuilder(collection, one=True, upsert=upsert)
-
-
-def update_many(collection: Collection, upsert: bool = False):
-    return UpdateBuilder(collection, one=False, upsert=upsert)
-
-
-class DeleteBuilder(Executable):
-    """
-    Delete builder
-    """
-
-    def __init__(self, collection: Collection):
-        self.collection = collection
-        self.filter_expression = {}
-
-    def filter(self, expression: Expression):
-        self.filter_expression.update(expression.to_obj(Context.CRUD))
-
-
-def delete(collection: Collection):
-    return DeleteBuilder(collection)
-
-
-class AggregationPipelineBuilder(Executable):
-    """
-    Aggregation pipeline builder
-    """
-
-    def __init__(self, collection: Collection = None):
-        self.collection = collection
-        self.stages = []
-
-    def match(self, query: Expression) -> 'AggregationPipelineBuilder':
-        self.stages.append(MatchPipelineStage(query))
-        return self
-
-    def add_fields(self, **kwargs) -> 'AggregationPipelineBuilder':
-        self.stages.append(AddFieldsPipelineStage(**kwargs))
-        return self
-
-    def bucket(self, group_by: Expression,
-               boundaries: Union[Iterable[int], Iterable[float]],
-               default: Any,
-               **kwargs: Expression) -> 'AggregationPipelineBuilder':
-        self.stages.append(BucketPipelineStage(group_by, boundaries, default, **kwargs))
-        return self
-
-    def project(self, *args: Field, **kwargs) -> 'AggregationPipelineBuilder':
-        self.stages.append(ProjectPipelineStage(*args, **kwargs))
-        return self
-
-    def group(self, _id,
-              **kwargs: 'AccumulatorExpression') -> \
-            'AggregationPipelineBuilder':
-        self.stages.append(GroupPipelineStage(_id, **kwargs))
-        return self
-
-    def lookup(self, collection: Collection, local_field: Union[str, Field],
-               foreign_field: Union[str, Field],
-               as_: str) -> 'AggregationPipelineBuilder':
-        self.stages.append(
-            LookupPipelineStage(collection, local_field, foreign_field, as_))
-        return self
-
-    def replace_root(self,
-                     new_root: Expression) -> 'AggregationPipelineBuilder':
-        self.stages.append(ReplaceRootPipelineStage(new_root))
-        return self
-
-    def unset(self, *excluded_fields: Union[Field, str]) -> 'AggregationPipelineBuilder':
-        self.stages.append(UnsetPipelineStage(*excluded_fields))
-        return self
-
-    def unwind(self, field: Field) -> 'AggregationPipelineBuilder':
-        self.stages.append(UnwindPipelineStage(field))
-        return self
-
-    def sort(self, *args: Tuple[Union[Field, str], int]) -> 'AggregationPipelineBuilder':
-        self.stages.append(SortPipelineStage(*args))
-        return self
-
-    def facet(self, **kwargs: 'AggregationPipelineBuilder') -> 'AggregationPipelineBuilder':
-        self.stages.append(FacetPipelineStage(**kwargs))
-        return self
-
-    def get_pipeline(self):
-        return [stage.to_obj(Context.AGGREGATION) for stage in self.stages]
-
-
-def aggregate(collection: Collection = None):
-    return AggregationPipelineBuilder(collection)
-
-
 class PipelineStage(Expression):
     """
     Expression that represents one pipeline stage
@@ -849,7 +497,8 @@ class SortPipelineStage(PipelineStage):
         self.fields = args
 
     def to_obj(self, context: int = Context.AGGREGATION):
-        return {'$sort': dict((str(field[0]), field[1]) for field in self.fields)}
+        return {
+            '$sort': dict((str(field[0]), field[1]) for field in self.fields)}
 
 
 class GroupPipelineStage(PipelineStage):
@@ -880,7 +529,7 @@ class FacetPipelineStage(PipelineStage):
     of documents.
     """
 
-    def __init__(self, **kwargs: AggregationPipelineBuilder):
+    def __init__(self, **kwargs: 'AggregationPipelineBuilder'):
         self.kw = kwargs
 
     def to_obj(self, context: int = Context.AGGREGATION):
@@ -1493,3 +1142,223 @@ class ListExpression(Expression):
 
 def list_(*args: Any):
     return ListExpression(*args)
+
+
+# Builders go to this module, because some expressions depend on
+# builders, e.g. facet.
+
+
+class Executable(object):
+    """
+    Common base for anything which can be executed on
+    the database connection, such as inserts, queries,
+    aggregations etc.
+    """
+
+
+class QueryBuilder(Executable):
+    """
+    Query object builder
+    """
+
+    def __init__(self, collection: Collection, one: bool = False):
+        self.collection = collection
+        self.one = one
+        self.query_filer_document = {}
+        self.sort_list = []
+
+    def filter(self, expression: 'Expression') -> 'QueryBuilder':
+        self.query_filer_document.update(expression.to_obj(Context.CRUD))
+        return self
+
+    def sort(self, *args: Tuple[Union[str, 'Field'], int]) -> 'QueryBuilder':
+        args = [(str(f), order) for f, order in args]
+        self.sort_list += args
+        return self
+
+    def get_query_filter_document(self) -> dict:
+        return self.query_filer_document
+
+
+def query(collection: Collection) -> QueryBuilder:
+    return QueryBuilder(collection)
+
+
+def query_one(collection: Collection) -> QueryBuilder:
+    return QueryBuilder(collection, True)
+
+
+class InsertBuilder(Executable):
+    """
+    Insert builder
+    """
+
+    def __init__(self, collection: Collection, one: bool, *args: dict):
+        self.collection = collection
+        self.one = one
+        self.documents = args
+
+
+def insert_one(collection: Collection, document: dict):
+    return InsertBuilder(collection, True, *[document])
+
+
+def insert_many(collection: Collection, documents: Iterable[dict]):
+    return InsertBuilder(collection, False, *documents)
+
+
+class UpdateBuilder(Executable):
+    """
+    Update builder
+    """
+
+    def __init__(self, collection: Collection, one: bool = False,
+                 upsert: bool = False):
+        self.collection = collection
+        self.one = one
+        self.upsert = upsert
+        self.filter_expression = {}
+        self.update_operators = {}
+
+    def filter(self, expression: Expression) -> 'UpdateBuilder':
+        self.filter_expression.update(expression.to_obj(Context.CRUD))
+        return self
+
+    def set(self, d: dict) -> 'UpdateBuilder':
+        self.update_operators.update({'$set': d})
+        return self
+
+    def unset(self, *fields: str) -> 'UpdateBuilder':
+        self.update_operators.update(
+            {'$unset': dict((field, '') for field in fields)})
+        return self
+
+
+def update(collection: Collection, upsert: bool = False):
+    return UpdateBuilder(collection, upsert=upsert)
+
+
+def update_one(collection: Collection, upsert: bool = False):
+    return UpdateBuilder(collection, one=True, upsert=upsert)
+
+
+def update_many(collection: Collection, upsert: bool = False):
+    return UpdateBuilder(collection, one=False, upsert=upsert)
+
+
+class DeleteBuilder(Executable):
+    """
+    Delete builder
+    """
+
+    def __init__(self, collection: Collection):
+        self.collection = collection
+        self.filter_expression = {}
+
+    def filter(self, expression: Expression):
+        self.filter_expression.update(expression.to_obj(Context.CRUD))
+
+
+def delete(collection: Collection):
+    return DeleteBuilder(collection)
+
+
+class AggregationPipelineBuilder(Executable):
+    """
+    Aggregation pipeline builder
+    """
+
+    def __init__(self, collection: Collection = None):
+        self.collection = collection
+        self.stages = []
+
+    def match(self, query: Expression) -> 'AggregationPipelineBuilder':
+        self.stages.append(MatchPipelineStage(query))
+        return self
+
+    def add_fields(self, **kwargs) -> 'AggregationPipelineBuilder':
+        self.stages.append(AddFieldsPipelineStage(**kwargs))
+        return self
+
+    def bucket(self, group_by: Expression,
+               boundaries: Union[Iterable[int], Iterable[float]],
+               default: Any,
+               **kwargs: Expression) -> 'AggregationPipelineBuilder':
+        self.stages.append(
+            BucketPipelineStage(group_by, boundaries, default, **kwargs))
+        return self
+
+    def project(self, *args: Field, **kwargs) -> 'AggregationPipelineBuilder':
+        self.stages.append(ProjectPipelineStage(*args, **kwargs))
+        return self
+
+    def group(self, _id,
+              **kwargs: 'AccumulatorExpression') -> \
+            'AggregationPipelineBuilder':
+        self.stages.append(GroupPipelineStage(_id, **kwargs))
+        return self
+
+    def lookup(self, collection: Collection, local_field: Union[str, Field],
+               foreign_field: Union[str, Field],
+               as_: str) -> 'AggregationPipelineBuilder':
+        self.stages.append(
+            LookupPipelineStage(collection, local_field, foreign_field, as_))
+        return self
+
+    def replace_root(self,
+                     new_root: Expression) -> 'AggregationPipelineBuilder':
+        self.stages.append(ReplaceRootPipelineStage(new_root))
+        return self
+
+    def unset(self, *excluded_fields: Union[
+        Field, str]) -> 'AggregationPipelineBuilder':
+        self.stages.append(UnsetPipelineStage(*excluded_fields))
+        return self
+
+    def unwind(self, field: Field) -> 'AggregationPipelineBuilder':
+        self.stages.append(UnwindPipelineStage(field))
+        return self
+
+    def sort(self, *args: Tuple[Union[
+        Field, str], int]) -> 'AggregationPipelineBuilder':
+        self.stages.append(SortPipelineStage(*args))
+        return self
+
+    def facet(self,
+              **kwargs: 'AggregationPipelineBuilder') -> 'AggregationPipelineBuilder':
+        self.stages.append(FacetPipelineStage(**kwargs))
+        return self
+
+    def get_pipeline(self):
+        return [stage.to_obj(Context.AGGREGATION) for stage in self.stages]
+
+
+def aggregate(collection: Collection = None):
+    return AggregationPipelineBuilder(collection)
+
+
+class IndexBuilder(object):
+    """
+    Index object builder, to execute create_index
+    """
+
+    def __init__(self, collection: Collection):
+        self.collection = collection
+        self.keys = []
+        self.is_unique = False
+
+    def asc(self, field: str) -> 'IndexBuilder':
+        self.keys.append((field, pymongo.ASCENDING))
+        return self
+
+    def desc(self, field: str) -> 'IndexBuilder':
+        self.keys.append((field, pymongo.DESCENDING))
+        return self
+
+    def unique(self) -> 'IndexBuilder':
+        self.is_unique = True
+        return self
+
+
+def index(collection: Collection) -> IndexBuilder:
+    return IndexBuilder(collection)
